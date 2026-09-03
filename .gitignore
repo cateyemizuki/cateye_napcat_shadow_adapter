@@ -1,0 +1,7 @@
+/config.toml
+__pycache__/
+*.pyc
+/data/
+
+# Issue 提交文档（本地使用，不随插件上传）
+/ISSUE_SUBMISSION.md

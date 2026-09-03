@@ -1,0 +1,45 @@
+{
+  "manifest_version": 2,
+  "id": "cateye.napcat-shadow-adapter",
+  "version": "0.1.0",
+  "name": "NapCat 影子适配器",
+  "description": "影子中继：监控 NapCat 适配器易被去重误丢的四类通知（表情回应/群撤回/好友撤回/精华消息），通过独立 OneBot WebSocket 连接协议端，对适配器未成功入站的事件以 is_notify 合成通知补投；适配器已送达的事件自动跳过。不改写、不拦截、不依赖适配器配置，上游修复后自动失效。",
+  "author": {
+    "name": "cateye",
+    "url": "https://github.com/cateyemizuki"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/cateyemizuki/cateye_napcat_shadow_adapter",
+    "homepage": "https://github.com/cateyemizuki/cateye_napcat_shadow_adapter",
+    "documentation": "https://github.com/cateyemizuki/cateye_napcat_shadow_adapter/blob/main/README.md",
+    "issues": "https://github.com/cateyemizuki/cateye_napcat_shadow_adapter/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.3.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "websockets",
+      "version_spec": ">=10.0"
+    }
+  ],
+  "capabilities": [],
+  "i18n": {
+    "default_locale": "zh-CN"
+  },
+  "plugin_type": "adapter",
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "ghost"
+    }
+  },
+  "changelog": "CHANGELOG.md"
+}
