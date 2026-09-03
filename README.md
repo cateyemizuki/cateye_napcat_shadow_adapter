@@ -83,11 +83,16 @@ NapCat/SnowLuma 本体 ──WS广播──┬─> Napcat 适配器 ──route_
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `group_list_mode` | `disabled` | `whitelist` / `blacklist` / `disabled` |
-| `group_list` | `[]` | 群号列表 |
-| `ban_user_id` | `[]` | 屏蔽用户（其相关通知一律不补投） |
+| `sync_from_adapter` | `true` | **自动镜像**官方 Napcat 适配器 `[chat]` 名单（群/私聊白黑名单 + `ban_user_id`），每次插件加载/自身配置热更新时同步一次 |
+| `adapter_plugin_id` | `maibot-team.napcat-adapter` | 名单来源适配器的插件 id（一般无需改动） |
+| `group_list_mode` | `disabled` | 手动模式：`whitelist` / `blacklist` / `disabled`（`sync_from_adapter=false` 时生效） |
+| `group_list` | `[]` | 手动模式群号列表 |
+| `private_list_mode` | `disabled` | 手动模式私聊名单模式 |
+| `private_list` | `[]` | 手动模式私聊用户号列表 |
+| `ban_user_id` | `[]` | 手动模式屏蔽用户（其相关通知一律不补投） |
 
-> ⚠️ 如果适配器侧配置了群名单/屏蔽用户（`[chat]` 节），请在本节**镜像相同配置**，否则适配器过滤掉的群的通知会被本插件越权补投。适配器未用名单（默认全放行）时保持 `disabled` 即可。
+> ✅ **默认开启自动镜像**：插件会读取官方 Napcat 适配器（`maibot-team.napcat-adapter`）`config.toml` 的 `[chat]` 节，把 `enable_chat_list_filter` / `group_list_type` / `group_list` / `private_list_type` / `private_list` / `ban_user_id` 的生效口径镜像为补投范围——适配器名单过滤掉的群/用户的通知不会被越权补投。镜像在插件加载与自身配置热更新时执行，名单改动后重载本插件（或改本插件任意配置触发热更新）即生效。
+> 关闭 `sync_from_adapter` 后回退到本节的**手动名单**（供无官方适配器/自研适配器场景使用）。镜像或读取失败（官方适配器未安装/停用）时自动回退手动名单并告警，不影响加载。
 
 ## 安装与验证
 
@@ -100,9 +105,10 @@ NapCat/SnowLuma 本体 ──WS广播──┬─> Napcat 适配器 ──route_
 ## 注意事项
 
 - 本插件**只补四类通知**，普通消息事件一律不碰——消息入站仍由适配器独家负责，不会出现双份消息。
-- 本插件声明了**零宿主能力**（manifest `capabilities` 为空）：`route_message` / `update_state` 走宿主专用 RPC 免声明，Hook 免声明，昵称查询走本插件自己的 WS 连接而非适配器 API。
+- 本插件声明的宿主能力仅 `config.get_plugin`（用于自动镜像官方适配器名单）：`route_message` / `update_state` 走宿主专用 RPC 免声明，Hook 免声明，昵称查询走本插件自己的 WS 连接而非适配器 API。**manifest 已新增能力与依赖声明，升级本插件后需完整重启 MaiBot 一次**（manifest 变更不做热重载）。
+- 自动镜像为**软依赖**：官方适配器 `maibot-team.napcat-adapter` 未安装/停用时，镜像告警并回退手动名单，其余功能不受影响；随后 napcat 加载后，重载本插件（或改本插件任意配置）即可重新镜像。
 - 机器人自己贴表情的通知也会被照常处理（与适配器行为一致）；若安装了表情回应翻译插件，其自带的"机器人自身回应跳过翻译"逻辑不受影响。
-- 修改 `[server]` 配置后无需重启，插件会自动重建连接；manifest 变更（如能力声明）仍需完整重启 MaiBot。
+- 修改 `[server]` 配置后无需重启，插件会自动重建连接；修改名单后重载本插件（或改本插件任意配置）即重新镜像。
 
 ## 故障排查
 

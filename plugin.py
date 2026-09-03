@@ -33,7 +33,7 @@ from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ErrorPolicy, HookMode, Ho
 from . import onebot_client, relay_core
 from .relay_core import SHADOW_MARKER_KEY
 
-SUPPORTED_CONFIG_VERSION = "0.1.0"
+SUPPORTED_CONFIG_VERSION = "0.2.0"
 GATEWAY_NAME = "napcat_shadow_gateway"
 PLUGIN_DISPLAY_NAME = "NapCat 影子适配器"
 
@@ -92,16 +92,37 @@ class RelaySectionConfig(PluginConfigBase):
 
 
 class FilterSectionConfig(PluginConfigBase):
-    """补投范围过滤（若适配器配置了名单，请在此镜像，防止越权范围的通知被补投）。"""
+    """补投范围过滤。
+
+    开启 sync_from_adapter（默认）后，本插件的名单在每次加载/热重载时自动
+    从官方 Napcat 适配器（maibot-team.napcat-adapter）的 [chat] 配置节镜像，
+    无需手动维护，防止把适配器名单外的群/用户的通知越权补投。
+    关闭时退回使用下方手动填写的名单。
+    """
 
     __ui_label__ = "范围过滤"
     __ui_icon__ = "filter_alt"
     __ui_order__ = 3
 
+    sync_from_adapter: bool = Field(
+        default=True,
+        description="自动镜像官方 Napcat 适配器 [chat] 名单（群/私聊白黑名单 + ban_user_id）",
+    )
+    adapter_plugin_id: str = Field(
+        default="maibot-team.napcat-adapter",
+        description="名单来源适配器的插件 id（一般无需改动）",
+        json_schema_extra={"hidden": True},
+    )
     group_list_mode: Literal["disabled", "whitelist", "blacklist"] = Field(
-        default="disabled", description="群名单模式（disabled=不过滤；与适配器 [chat] 名单保持一致）",
+        default="disabled",
+        description="群名单模式（sync_from_adapter=false 时生效；disabled=不过滤）",
     )
     group_list: list[str] = Field(default_factory=list, description="群号列表（whitelist/blacklist 模式下生效）")
+    private_list_mode: Literal["disabled", "whitelist", "blacklist"] = Field(
+        default="disabled",
+        description="私聊名单模式（sync_from_adapter=false 时生效；disabled=不过滤）",
+    )
+    private_list: list[str] = Field(default_factory=list, description="私聊用户号列表（whitelist/blacklist 模式下生效）")
     ban_user_id: list[str] = Field(default_factory=list, description="屏蔽用户：其相关通知一律不补投")
 
 
@@ -129,10 +150,12 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         self._decision_tasks: set[asyncio.Task] = set()
         self._name_cache: dict[tuple[str, str], tuple[float, str, str]] = {}
         self._group_name_cache: dict[str, tuple[float, str]] = {}
+        self._mirrored_filter: dict[str, Any] | None = None
 
         if not self.config.plugin.enabled:
             self.ctx.logger.info("%s 已加载，但 enabled=false，保持待机", PLUGIN_DISPLAY_NAME)
             return
+        await self._sync_filter_from_adapter()
         self._start_client()
 
     async def on_unload(self) -> None:
@@ -153,6 +176,8 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         self.ctx.logger.info("%s 配置热更新，重建协议端连接", PLUGIN_DISPLAY_NAME)
         await self._shutdown_client()
         self._seen_adapter = relay_core.TTLSet(float(self.config.relay.seen_ttl_seconds))
+        # 重新镜像适配器名单（sync_from_adapter 变更 / 开关切换后立即生效）
+        await self._sync_filter_from_adapter()
         self._start_client()
 
     # ==================== Hook：登记适配器已成功入站的通知（只读） ====================
@@ -232,17 +257,101 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             return
         await self._inject(payload, digest)
 
-    def _filter_allows(self, payload: Mapping[str, Any]) -> bool:
+    # ==================== 范围过滤：自动镜像官方适配器 [chat] 名单 ====================
+
+    async def _sync_filter_from_adapter(self) -> None:
+        """从官方 Napcat 适配器的 [chat] 配置节同步补投范围名单。
+
+        通过 config.get_plugin 能力读取 maibot-team.napcat-adapter 的运行时
+        config.toml（Host 侧磁盘实时内容），把其入站名单口径镜像为本插件的过滤
+        状态。镜像结果保存在实例状态 _mirrored_filter 中（不写回本插件
+        config.toml），每次调用读取一次最新值。
+
+        语义对齐官方 NapCatChatFilter（filters.py）：
+        - enable_chat_list_filter=false  → 群/私聊名单整体不生效（mode=disabled），
+          但 ban_user_id 仍全局生效；
+        - 群消息按 group_list_type/group_list，私聊按 private_list_type/private_list；
+        - ban_user_id 优先级最高。
+
+        读取失败（napcat 未安装/停用/异常）时记录告警并回退手动配置，绝不中断加载。
+        """
+        self._mirrored_filter: dict[str, Any] | None = None
+        if not self.config.filter.sync_from_adapter:
+            return
+        adapter_id = str(self.config.filter.adapter_plugin_id or "").strip() or "maibot-team.napcat-adapter"
+        try:
+            adapter_config = await self.ctx.config.get_plugin(adapter_id)
+        except Exception as exc:
+            self.ctx.logger.warning("读取适配器 %s 配置失败，回退手动名单: %s", adapter_id, exc)
+            return
+        if not isinstance(adapter_config, dict):
+            self.ctx.logger.warning("适配器 %s 配置为空，回退手动名单", adapter_id)
+            return
+        chat_cfg = adapter_config.get("chat")
+        if not isinstance(chat_cfg, dict):
+            self.ctx.logger.warning("适配器 %s 配置缺少 [chat] 节，回退手动名单", adapter_id)
+            return
+
+        def _norm_mode(value: Any, enabled: bool) -> str:
+            mode = str(value or "").strip().lower()
+            if not enabled or mode not in ("whitelist", "blacklist"):
+                return "disabled"
+            return mode
+
+        def _norm_ids(raw: Any) -> list[str]:
+            if not isinstance(raw, list):
+                return []
+            return [str(item).strip() for item in raw if str(item or "").strip()]
+
+        list_filter_enabled = bool(chat_cfg.get("enable_chat_list_filter", True))
+        group_mode = _norm_mode(chat_cfg.get("group_list_type"), list_filter_enabled)
+        private_mode = _norm_mode(chat_cfg.get("private_list_type"), list_filter_enabled)
+        self._mirrored_filter = {
+            "group_list_mode": group_mode,
+            "group_list": _norm_ids(chat_cfg.get("group_list")),
+            "private_list_mode": private_mode,
+            "private_list": _norm_ids(chat_cfg.get("private_list")),
+            "ban_user_id": _norm_ids(chat_cfg.get("ban_user_id")),
+        }
+        self.ctx.logger.info(
+            "已自动镜像适配器 %s 的 [chat] 名单: group=%s(%s) private=%s(%s) ban=%s",
+            adapter_id,
+            self._mirrored_filter["group_list_mode"],
+            len(self._mirrored_filter["group_list"]),
+            self._mirrored_filter["private_list_mode"],
+            len(self._mirrored_filter["private_list"]),
+            len(self._mirrored_filter["ban_user_id"]),
+        )
+
+    def _active_filter(self) -> dict[str, Any]:
+        """返回当前生效的过滤配置（自动镜像优先，否则手动配置）。"""
+        if self._mirrored_filter is not None:
+            return self._mirrored_filter
         cfg = self.config.filter
+        return {
+            "group_list_mode": cfg.group_list_mode,
+            "group_list": list(cfg.group_list or []),
+            "private_list_mode": cfg.private_list_mode,
+            "private_list": list(cfg.private_list or []),
+            "ban_user_id": list(cfg.ban_user_id or []),
+        }
+
+    def _filter_allows(self, payload: Mapping[str, Any]) -> bool:
+        f = self._active_filter()
         group_id = str(payload.get("group_id") or "").strip()
         actor_id = relay_core.resolve_actor_user_id(payload)
-        if group_id and cfg.group_list_mode in ("whitelist", "blacklist"):
-            listed = group_id in {str(x).strip() for x in (cfg.group_list or []) if str(x).strip()}
-            if cfg.group_list_mode == "whitelist" and not listed:
-                return False
-            if cfg.group_list_mode == "blacklist" and listed:
-                return False
-        if actor_id and actor_id in {str(x).strip() for x in (cfg.ban_user_id or []) if str(x).strip()}:
+        ids = {str(x).strip() for x in (f["ban_user_id"] or []) if str(x).strip()}
+        if actor_id and actor_id in ids:
+            return False
+        if group_id:
+            mode = f["group_list_mode"]
+            listed = group_id in {str(x).strip() for x in (f["group_list"] or []) if str(x).strip()}
+        else:
+            mode = f["private_list_mode"]
+            listed = actor_id in {str(x).strip() for x in (f["private_list"] or []) if str(x).strip()}
+        if mode == "whitelist" and not listed:
+            return False
+        if mode == "blacklist" and listed:
             return False
         return True
 
