@@ -33,7 +33,7 @@ from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ErrorPolicy, HookMode, Ho
 from . import onebot_client, relay_core
 from .relay_core import SHADOW_MARKER_KEY
 
-SUPPORTED_CONFIG_VERSION = "0.2.0"
+SUPPORTED_CONFIG_VERSION = "0.2.1"
 GATEWAY_NAME = "napcat_shadow_gateway"
 PLUGIN_DISPLAY_NAME = "NapCat 影子适配器"
 
@@ -45,11 +45,23 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_icon__ = "ghost"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用影子适配器")
+    enabled: bool = Field(
+        default=True,
+        description="是否启用影子适配器",
+        json_schema_extra={
+            "label": "启用插件",
+            "hint": "插件总开关",
+        },
+    )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="配置版本（与插件版本同步）",
-        json_schema_extra={"hidden": True, "disabled": True},
+        json_schema_extra={
+            "hidden": True,
+            "disabled": True,
+            "label": "配置版本",
+            "hint": "配置版本，勿改",
+        },
     )
 
 
@@ -60,12 +72,54 @@ class ServerSectionConfig(PluginConfigBase):
     __ui_icon__ = "cable"
     __ui_order__ = 1
 
-    host: str = Field(default="127.0.0.1", description="协议端地址")
-    port: int = Field(default=3005, ge=1, le=65535, description="协议端正向 WS 端口")
-    path: str = Field(default="", description="WS 路径（通常留空，如需可填 /ws）")
-    token: str = Field(default="", description="访问令牌（与适配器共用同一协议端 token）")
-    reconnect_delay_sec: float = Field(default=5.0, ge=1.0, le=300.0, description="断线重连间隔（秒）")
-    action_timeout_sec: float = Field(default=5.0, ge=1.0, le=60.0, description="查昵称等 action 超时（秒）")
+    host: str = Field(
+        default="127.0.0.1",
+        description="协议端地址",
+        json_schema_extra={
+            "label": "协议端地址",
+            "hint": "协议端机器地址",
+        },
+    )
+    port: int = Field(
+        default=3005, ge=1, le=65535,
+        description="协议端正向 WS 端口",
+        json_schema_extra={
+            "label": "正向 WS 端口",
+            "hint": "正向 WS 端口",
+        },
+    )
+    path: str = Field(
+        default="",
+        description="WS 路径（通常留空，如需可填 /ws）",
+        json_schema_extra={
+            "label": "WS 路径",
+            "hint": "WS 路径，通常留空",
+        },
+    )
+    token: str = Field(
+        default="",
+        description="访问令牌（与适配器共用同一协议端 token）",
+        json_schema_extra={
+            "label": "访问令牌",
+            "hint": "协议端访问令牌",
+        },
+    )
+    reconnect_delay_sec: float = Field(
+        default=5.0, ge=1.0, le=300.0,
+        description="断线重连间隔（秒）",
+        json_schema_extra={
+            "label": "断线重连间隔（秒）",
+            "hint": "断线重连间隔秒数",
+        },
+    )
+    action_timeout_sec: float = Field(
+        default=5.0, ge=1.0, le=60.0,
+        description="查昵称等 action 超时（秒）",
+        json_schema_extra={
+            "label": "action 超时（秒）",
+            "hint": "查昵称等操作超时",
+        },
+    )
 
 
 class RelaySectionConfig(PluginConfigBase):
@@ -75,20 +129,70 @@ class RelaySectionConfig(PluginConfigBase):
     __ui_icon__ = "bell_ring"
     __ui_order__ = 2
 
-    enable_group_msg_emoji_like: bool = Field(default=True, description="接管：表情回应通知")
-    enable_group_recall: bool = Field(default=True, description="接管：群消息撤回通知")
-    enable_friend_recall: bool = Field(default=True, description="接管：好友消息撤回通知")
-    enable_essence: bool = Field(default=True, description="接管：精华消息通知")
+    enable_group_msg_emoji_like: bool = Field(
+        default=True,
+        description="接管：表情回应通知",
+        json_schema_extra={
+            "label": "接管表情回应通知",
+            "hint": "漏投表情回应则补投",
+        },
+    )
+    enable_group_recall: bool = Field(
+        default=True,
+        description="接管：群消息撤回通知",
+        json_schema_extra={
+            "label": "接管群消息撤回通知",
+            "hint": "漏投群消息撤回则补投",
+        },
+    )
+    enable_friend_recall: bool = Field(
+        default=True,
+        description="接管：好友消息撤回通知",
+        json_schema_extra={
+            "label": "接管好友消息撤回通知",
+            "hint": "漏投好友撤回则补投",
+        },
+    )
+    enable_essence: bool = Field(
+        default=True,
+        description="接管：精华消息通知",
+        json_schema_extra={
+            "label": "接管精华消息通知",
+            "hint": "漏投精华消息则补投",
+        },
+    )
     debounce_seconds: float = Field(
         default=2.0, ge=0.5, le=30.0,
         description="去抖窗口（秒）：等待适配器版本入站后再决策是否补投",
+        json_schema_extra={
+            "label": "去抖窗口（秒）",
+            "hint": "等待适配器送达的秒数",
+        },
     )
     seen_ttl_seconds: float = Field(
         default=120.0, ge=10.0, le=3600.0,
         description="适配器已送达登记的保留时长（秒）",
+        json_schema_extra={
+            "label": "送达登记保留时长（秒）",
+            "hint": "送达登记保留秒数",
+        },
     )
-    resolve_nicknames: bool = Field(default=True, description="补投前通过协议端查询昵称/群名（失败回退 QQ 号）")
-    nickname_cache_ttl_sec: float = Field(default=600.0, ge=10.0, le=86400.0, description="昵称缓存时长（秒）")
+    resolve_nicknames: bool = Field(
+        default=True,
+        description="补投前通过协议端查询昵称/群名（失败回退 QQ 号）",
+        json_schema_extra={
+            "label": "补投前查询昵称/群名",
+            "hint": "补投前查昵称群名",
+        },
+    )
+    nickname_cache_ttl_sec: float = Field(
+        default=600.0, ge=10.0, le=86400.0,
+        description="昵称缓存时长（秒）",
+        json_schema_extra={
+            "label": "昵称缓存时长（秒）",
+            "hint": "昵称缓存时长秒数",
+        },
+    )
 
 
 class FilterSectionConfig(PluginConfigBase):
@@ -107,23 +211,60 @@ class FilterSectionConfig(PluginConfigBase):
     sync_from_adapter: bool = Field(
         default=True,
         description="自动镜像官方 Napcat 适配器 [chat] 名单（群/私聊白黑名单 + ban_user_id）",
+        json_schema_extra={
+            "label": "自动镜像适配器名单",
+            "hint": "自动镜像适配器名单",
+        },
     )
     adapter_plugin_id: str = Field(
         default="maibot-team.napcat-adapter",
         description="名单来源适配器的插件 id（一般无需改动）",
-        json_schema_extra={"hidden": True},
+        json_schema_extra={
+            "hidden": True,
+            "label": "名单来源适配器 id",
+            "hint": "名单来源适配器 id",
+        },
     )
     group_list_mode: Literal["disabled", "whitelist", "blacklist"] = Field(
         default="disabled",
         description="群名单模式（sync_from_adapter=false 时生效；disabled=不过滤）",
+        json_schema_extra={
+            "label": "群名单模式",
+            "hint": "群名单手动过滤方式",
+        },
     )
-    group_list: list[str] = Field(default_factory=list, description="群号列表（whitelist/blacklist 模式下生效）")
+    group_list: list[str] = Field(
+        default_factory=list,
+        description="群号列表（whitelist/blacklist 模式下生效）",
+        json_schema_extra={
+            "label": "群号列表",
+            "hint": "群号列表，一行一个",
+        },
+    )
     private_list_mode: Literal["disabled", "whitelist", "blacklist"] = Field(
         default="disabled",
         description="私聊名单模式（sync_from_adapter=false 时生效；disabled=不过滤）",
+        json_schema_extra={
+            "label": "私聊名单模式",
+            "hint": "私聊名单手动过滤方式",
+        },
     )
-    private_list: list[str] = Field(default_factory=list, description="私聊用户号列表（whitelist/blacklist 模式下生效）")
-    ban_user_id: list[str] = Field(default_factory=list, description="屏蔽用户：其相关通知一律不补投")
+    private_list: list[str] = Field(
+        default_factory=list,
+        description="私聊用户号列表（whitelist/blacklist 模式下生效）",
+        json_schema_extra={
+            "label": "私聊用户列表",
+            "hint": "用户 QQ 号，一行一个",
+        },
+    )
+    ban_user_id: list[str] = Field(
+        default_factory=list,
+        description="屏蔽用户：其相关通知一律不补投",
+        json_schema_extra={
+            "label": "屏蔽用户",
+            "hint": "这些用户不补投通知",
+        },
+    )
 
 
 class ShadowAdapterConfig(PluginConfigBase):
