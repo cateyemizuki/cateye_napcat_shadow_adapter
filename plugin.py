@@ -33,9 +33,14 @@ from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ErrorPolicy, HookMode, Ho
 from . import onebot_client, relay_core
 from .relay_core import SHADOW_MARKER_KEY
 
-SUPPORTED_CONFIG_VERSION = "0.2.1"
+SUPPORTED_CONFIG_VERSION = "0.2.2"
 GATEWAY_NAME = "napcat_shadow_gateway"
 PLUGIN_DISPLAY_NAME = "NapCat 影子适配器"
+
+# 镜像失败后的最小重试间隔（秒）：避免每条事件都打一次跨插件 RPC。
+MIRROR_RETRY_INTERVAL_SEC = 10.0
+# 镜像连续失败时的告警限流间隔（秒）：保证问题可见，但不刷屏。
+MIRROR_FAIL_LOG_INTERVAL_SEC = 300.0
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -198,10 +203,10 @@ class RelaySectionConfig(PluginConfigBase):
 class FilterSectionConfig(PluginConfigBase):
     """补投范围过滤。
 
-    开启 sync_from_adapter（默认）后，本插件的名单在每次加载/热重载时自动
-    从官方 Napcat 适配器（maibot-team.napcat-adapter）的 [chat] 配置节镜像，
-    无需手动维护，防止把适配器名单外的群/用户的通知越权补投。
-    关闭时退回使用下方手动填写的名单。
+    开启 sync_from_adapter（默认）后，本插件在加载、配置热更新以及镜像过期时
+    自动从官方 Napcat 适配器（maibot-team.napcat-adapter）的 [chat] 配置节镜像
+    名单（群/私聊白黑名单 + ban_user_id），无需手动维护，防止把适配器名单外的
+    群/用户的通知越权补投。关闭时退回使用下方手动填写的名单。
     """
 
     __ui_label__ = "范围过滤"
@@ -265,6 +270,28 @@ class FilterSectionConfig(PluginConfigBase):
             "hint": "这些用户不补投通知",
         },
     )
+    mirror_refresh_seconds: float = Field(
+        default=60.0, ge=0.0, le=3600.0,
+        description=(
+            "镜像名单的刷新间隔（秒）：到点后的下一次补投决策会重新读取适配器名单，"
+            "使适配器侧新增/移除的屏蔽用户与群名单自动生效；0 表示只在加载与配置热更新时镜像一次"
+        ),
+        json_schema_extra={
+            "label": "名单刷新间隔（秒）",
+            "hint": "0 = 只在加载时镜像一次",
+        },
+    )
+    mirror_fail_closed: bool = Field(
+        default=False,
+        description=(
+            "镜像读不到适配器名单时是否拒绝一切补投（fail-closed）：开启后宁可漏投也不越权；"
+            "关闭则回退上方手动名单（默认，行为与旧版一致）"
+        ),
+        json_schema_extra={
+            "label": "镜像失败即拒投",
+            "hint": "宁漏投不越权",
+        },
+    )
 
 
 class ShadowAdapterConfig(PluginConfigBase):
@@ -292,6 +319,10 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         self._name_cache: dict[tuple[str, str], tuple[float, str, str]] = {}
         self._group_name_cache: dict[str, tuple[float, str]] = {}
         self._mirrored_filter: dict[str, Any] | None = None
+        # 镜像时序状态：成功时刻 / 上次尝试时刻（失败退避）/ 上次失败告警时刻（限流）
+        self._mirror_at: float = 0.0
+        self._mirror_attempt_at: float = 0.0
+        self._mirror_fail_log_at: float = 0.0
 
         if not self.config.plugin.enabled:
             self.ctx.logger.info("%s 已加载，但 enabled=false，保持待机", PLUGIN_DISPLAY_NAME)
@@ -318,6 +349,8 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         await self._shutdown_client()
         self._seen_adapter = relay_core.TTLSet(float(self.config.relay.seen_ttl_seconds))
         # 重新镜像适配器名单（sync_from_adapter 变更 / 开关切换后立即生效）
+        self._mirror_attempt_at = 0.0
+        self._mirror_fail_log_at = 0.0
         await self._sync_filter_from_adapter()
         self._start_client()
 
@@ -393,6 +426,9 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             return
         if self._injected.contains(digest):
             return
+        # 决策前按需（重）镜像适配器名单：兜住「启动时适配器尚未就绪」的竞态，
+        # 也让适配器侧名单改动在 mirror_refresh_seconds 内自动生效。
+        await self._ensure_filter_fresh()
         if not self._filter_allows(payload):
             self.ctx.logger.debug("补投范围过滤拒绝该通知 notice_type=%s", payload.get("notice_type"))
             return
@@ -406,7 +442,7 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         通过 config.get_plugin 能力读取 maibot-team.napcat-adapter 的运行时
         config.toml（Host 侧磁盘实时内容），把其入站名单口径镜像为本插件的过滤
         状态。镜像结果保存在实例状态 _mirrored_filter 中（不写回本插件
-        config.toml），每次调用读取一次最新值。
+        config.toml）。
 
         语义对齐官方 NapCatChatFilter（filters.py）：
         - enable_chat_list_filter=false  → 群/私聊名单整体不生效（mode=disabled），
@@ -414,8 +450,13 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         - 群消息按 group_list_type/group_list，私聊按 private_list_type/private_list；
         - ban_user_id 优先级最高。
 
-        读取失败（napcat 未安装/停用/异常）时记录告警并回退手动配置，绝不中断加载。
+        读取失败（适配器尚未就绪 / 未安装 / 停用 / 异常）时**只记录状态、不抛异常**，
+        由 :meth:`_ensure_filter_fresh` 在后续补投决策时自动重试——这一点很关键：
+        本插件的 on_load 早于同组 Napcat 适配器注册完成，首次镜像必然失败，
+        旧实现不重试，于是永久回退到（默认为空的）手动名单，全局屏蔽用户被照常补投。
         """
+
+        self._mirror_attempt_at = time.time()
         self._mirrored_filter: dict[str, Any] | None = None
         if not self.config.filter.sync_from_adapter:
             return
@@ -423,14 +464,30 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         try:
             adapter_config = await self.ctx.config.get_plugin(adapter_id)
         except Exception as exc:
-            self.ctx.logger.warning("读取适配器 %s 配置失败，回退手动名单: %s", adapter_id, exc)
+            self._log_mirror_failure(
+                "读取适配器 %s 配置失败（%s），暂时无法镜像补投名单；"
+                "适配器就绪后会在下一次补投决策时自动重试",
+                adapter_id, exc,
+            )
             return
         if not isinstance(adapter_config, dict):
-            self.ctx.logger.warning("适配器 %s 配置为空，回退手动名单", adapter_id)
+            self._log_mirror_failure(
+                "适配器 %s 配置读取结果不是字典（%r），暂时无法镜像补投名单；"
+                "适配器就绪后会自动重试",
+                adapter_id, adapter_config,
+            )
             return
         chat_cfg = adapter_config.get("chat")
         if not isinstance(chat_cfg, dict):
-            self.ctx.logger.warning("适配器 %s 配置缺少 [chat] 节，回退手动名单", adapter_id)
+            # 两种常见成因，用读到的顶层键区分：
+            # ① 本插件 on_load 早于同组适配器注册完成 → 宿主解析不到适配器目录，返回 {}；
+            # ② filter.adapter_plugin_id 填错 → 读回的是本插件自己的配置（含 relay/filter 等键）。
+            self._log_mirror_failure(
+                "适配器 %s 配置缺少 [chat] 节（读到顶层键 %s），暂时无法镜像补投名单；"
+                "适配器就绪后会自动重试。若上面列出的是本插件自己的配置键，"
+                "请检查 filter.adapter_plugin_id 是否写错",
+                adapter_id, sorted(adapter_config.keys()),
+            )
             return
 
         def _norm_mode(value: Any, enabled: bool) -> str:
@@ -454,6 +511,8 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             "private_list": _norm_ids(chat_cfg.get("private_list")),
             "ban_user_id": _norm_ids(chat_cfg.get("ban_user_id")),
         }
+        self._mirror_at = time.time()
+        self._mirror_fail_log_at = 0.0
         self.ctx.logger.info(
             "已自动镜像适配器 %s 的 [chat] 名单: group=%s(%s) private=%s(%s) ban=%s",
             adapter_id,
@@ -464,10 +523,52 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             len(self._mirrored_filter["ban_user_id"]),
         )
 
-    def _active_filter(self) -> dict[str, Any]:
-        """返回当前生效的过滤配置（自动镜像优先，否则手动配置）。"""
-        if self._mirrored_filter is not None:
-            return self._mirrored_filter
+    def _log_mirror_failure(self, message: str, *args: Any) -> None:
+        """限流记录镜像失败：问题必须可见，但不能每条补投都刷屏。"""
+
+        now = time.time()
+        if now - self._mirror_fail_log_at < MIRROR_FAIL_LOG_INTERVAL_SEC:
+            return
+        self._mirror_fail_log_at = now
+        self.ctx.logger.warning(message, *args)
+
+    def _mirror_is_stale(self) -> bool:
+        """镜像缺失或已过刷新间隔时需要重新读取适配器名单。"""
+
+        if self._mirrored_filter is None:
+            return True
+        refresh = float(self.config.filter.mirror_refresh_seconds)
+        if refresh <= 0:
+            return False
+        return (time.time() - self._mirror_at) >= refresh
+
+    async def _ensure_filter_fresh(self) -> None:
+        """补投决策前按需（重）镜像适配器名单。
+
+        修掉「镜像只在加载时尝试一次」这一缺陷的关键：
+
+        - **从未镜像成功**（启动竞态最常见）：每次决策都重试，直到拿到适配器名单为止——
+          绝不在「名单为空」的状态下继续放行；
+        - **已有快照但过期**：到 ``mirror_refresh_seconds`` 后重新读取，使适配器侧
+          新增/移除的屏蔽用户与群名单自动生效；
+        - **刷新失败但有旧快照**：按 ``MIRROR_RETRY_INTERVAL_SEC`` 退避，期间继续用旧快照过滤
+          （而不是退化成「不过滤」）。
+        """
+
+        if not self.config.filter.sync_from_adapter:
+            return
+        if not self._mirror_is_stale():
+            return
+        if (
+            self._mirrored_filter is not None
+            and time.time() - self._mirror_attempt_at < MIRROR_RETRY_INTERVAL_SEC
+        ):
+            return
+        await self._sync_filter_from_adapter()
+
+    def _manual_filter(self) -> dict[str, Any]:
+        """手动名单（sync_from_adapter=false 或镜像未就绪且未开启 fail-closed 时使用）。"""
+
         cfg = self.config.filter
         return {
             "group_list_mode": cfg.group_list_mode,
@@ -477,8 +578,23 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             "ban_user_id": list(cfg.ban_user_id or []),
         }
 
+    def _active_filter(self) -> dict[str, Any] | None:
+        """返回当前生效的过滤配置；``None`` 表示镜像未就绪且要求 fail-closed。"""
+
+        if self._mirrored_filter is not None:
+            return self._mirrored_filter
+        if self.config.filter.sync_from_adapter and self.config.filter.mirror_fail_closed:
+            return None
+        return self._manual_filter()
+
     def _filter_allows(self, payload: Mapping[str, Any]) -> bool:
         f = self._active_filter()
+        if f is None:
+            self._log_mirror_failure(
+                "补投名单尚未镜像成功且已开启 filter.mirror_fail_closed，暂不补投任何通知"
+                "（宁漏投不越权）；适配器就绪后会自动恢复"
+            )
+            return False
         group_id = str(payload.get("group_id") or "").strip()
         actor_id = relay_core.resolve_actor_user_id(payload)
         ids = {str(x).strip() for x in (f["ban_user_id"] or []) if str(x).strip()}

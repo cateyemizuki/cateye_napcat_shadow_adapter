@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "cateye.napcat-shadow-adapter",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "name": "NapCat 影子适配器",
   "description": "影子中继：监控 NapCat 适配器易被去重误丢的四类通知（表情回应/群撤回/好友撤回/精华消息），通过独立 OneBot WebSocket 连接协议端，对适配器未成功入站的事件以 is_notify 合成通知补投；适配器已送达的事件自动跳过。不改写、不拦截、不依赖适配器配置，上游修复后自动失效。",
   "author": {

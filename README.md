@@ -83,16 +83,25 @@ NapCat/SnowLuma 本体 ──WS广播──┬─> Napcat 适配器 ──route_
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `sync_from_adapter` | `true` | **自动镜像**官方 Napcat 适配器 `[chat]` 名单（群/私聊白黑名单 + `ban_user_id`），每次插件加载/自身配置热更新时同步一次 |
+| `sync_from_adapter` | `true` | **自动镜像**官方 Napcat 适配器 `[chat]` 名单（群/私聊白黑名单 + `ban_user_id`）：加载、配置热更新、以及快照过期时各同步一次 |
 | `adapter_plugin_id` | `maibot-team.napcat-adapter` | 名单来源适配器的插件 id（一般无需改动） |
 | `group_list_mode` | `disabled` | 手动模式：`whitelist` / `blacklist` / `disabled`（`sync_from_adapter=false` 时生效） |
 | `group_list` | `[]` | 手动模式群号列表 |
 | `private_list_mode` | `disabled` | 手动模式私聊名单模式 |
 | `private_list` | `[]` | 手动模式私聊用户号列表 |
 | `ban_user_id` | `[]` | 手动模式屏蔽用户（其相关通知一律不补投） |
+| `mirror_refresh_seconds` | `60` | 镜像名单刷新间隔（秒）：到点后的下一次补投决策会重读适配器名单，适配器侧新增/移除的屏蔽用户与群名单自动生效；`0` = 只在加载与配置热更新时镜像一次 |
+| `mirror_fail_closed` | `false` | 镜像读不到适配器名单时是否拒绝一切补投（宁漏投不越权）；关闭则回退上方手动名单 |
 
-> ✅ **默认开启自动镜像**：插件会读取官方 Napcat 适配器（`maibot-team.napcat-adapter`）`config.toml` 的 `[chat]` 节，把 `enable_chat_list_filter` / `group_list_type` / `group_list` / `private_list_type` / `private_list` / `ban_user_id` 的生效口径镜像为补投范围——适配器名单过滤掉的群/用户的通知不会被越权补投。镜像在插件加载与自身配置热更新时执行，名单改动后重载本插件（或改本插件任意配置触发热更新）即生效。
-> 关闭 `sync_from_adapter` 后回退到本节的**手动名单**（供无官方适配器/自研适配器场景使用）。镜像或读取失败（官方适配器未安装/停用）时自动回退手动名单并告警，不影响加载。
+> ✅ **默认开启自动镜像**：插件会读取官方 Napcat 适配器（`maibot-team.napcat-adapter`）`config.toml` 的 `[chat]` 节，把 `enable_chat_list_filter` / `group_list_type` / `group_list` / `private_list_type` / `private_list` / `ban_user_id` 的生效口径镜像为补投范围——适配器名单过滤掉的群/用户的通知不会被越权补投。
+>
+> ⚠️ **镜像不再只在启动时尝试一次**（0.2.2 修复）：本插件的 `on_load` 早于同一 Runner 组里的 Napcat 适配器注册完成，**首次镜像必然失败**。旧实现失败后不重试，于是永久回退到（默认为空的）手动名单，`ban_user_id` 形同虚设——被全局屏蔽的用户贴表情 / 撤回 / 设精华的通知会被照常补投。现在改为**每次补投决策前按需重试**：
+> - 从未镜像成功 → 每次决策都重试，绝不在「名单为空」状态下放行；
+> - 快照过期（`mirror_refresh_seconds`）→ 重新读取，适配器侧改名单无需重载本插件；
+> - 刷新失败但有旧快照 → 退避重试并继续用旧快照过滤，不会退化成「不过滤」。
+>
+> 镜像失败会打印**限流告警**并附上读到的顶层键：若列出的是本插件自己的键（`relay` / `filter` 等），说明 `adapter_plugin_id` 填错；若为空则确认是启动竞态，适配器就绪后会自动恢复。需要硬性保证时把 `mirror_fail_closed` 打开。
+> 关闭 `sync_from_adapter` 后回退到本节的**手动名单**（供无官方适配器/自研适配器场景使用）。
 
 ## 安装与验证
 
@@ -108,7 +117,7 @@ NapCat/SnowLuma 本体 ──WS广播──┬─> Napcat 适配器 ──route_
 - 本插件声明的宿主能力仅 `config.get_plugin`（用于自动镜像官方适配器名单）：`route_message` / `update_state` 走宿主专用 RPC 免声明，Hook 免声明，昵称查询走本插件自己的 WS 连接而非适配器 API。**manifest 已新增能力与依赖声明，升级本插件后需完整重启 MaiBot 一次**（manifest 变更不做热重载）。
 - 自动镜像为**软依赖**：官方适配器 `maibot-team.napcat-adapter` 未安装/停用时，镜像告警并回退手动名单，其余功能不受影响；随后 napcat 加载后，重载本插件（或改本插件任意配置）即可重新镜像。
 - 机器人自己贴表情的通知也会被照常处理（与适配器行为一致）；若安装了表情回应翻译插件，其自带的"机器人自身回应跳过翻译"逻辑不受影响。
-- 修改 `[server]` 配置后无需重启，插件会自动重建连接；修改名单后重载本插件（或改本插件任意配置）即重新镜像。
+- 修改 `[server]` 配置后无需重启，插件会自动重建连接；修改名单后无需重载——镜像最多 `mirror_refresh_seconds`（默认 60 秒）后自动跟上，想立刻生效可重载本插件或改本插件任意配置触发热更新。
 
 ## 故障排查
 
@@ -117,5 +126,6 @@ NapCat/SnowLuma 本体 ──WS广播──┬─> Napcat 适配器 ──route_
 | 日志反复出现"协议端连接异常" | 核对 `[server]` 的 host/port/token 是否与适配器 `[napcat_server]` 一致；协议端正向 WS 是否开启 |
 | 日志出现"缺少 websockets 依赖" | 删除插件目录后重新放入让 Runner 重装依赖，或手动 `pip install websockets` |
 | 补投的通知没进 WebUI 聊天记录 | 查主进程日志是否出现"宿主拒绝了补投"（网关未就绪/被去重）；确认 `[filter]` 未误过滤 |
+| **被屏蔽用户的通知仍被补投** | 先看日志有没有 `配置缺少 [chat] 节`：0.2.2 起会自动重试并打印读到的顶层键。若顶层键是本插件自己的（`relay` / `filter`），说明 `filter.adapter_plugin_id` 填错；若一直失败又想立刻止损，把 `filter.mirror_fail_closed` 打开（宁漏投不越权），并在 `[filter]` 手动名单里临时填上要屏蔽的 QQ |
 | 完全看不到补投日志 | 确认 `[plugin] enabled=true`、对应类型开关开启；确认事件确实发生在接管四类内 |
 | 适配器与插件同时报某通知 | 属预期内的偶发重复（适配器副本晚于去抖窗口），可适当调大 `debounce_seconds` |
