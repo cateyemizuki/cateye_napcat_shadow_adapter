@@ -15,6 +15,13 @@ group_msg_emoji_like / group_recall / friend_recall / essence 四类通知在宿
    未登记 → 以自有 receive 网关注入 is_notify 合成通知补投，
    dedupe_key 用事件摘要（与适配器的 message_id 键空间完全隔离）。
 
+补投决策（去抖后）依次经过：适配器送达登记 → 范围过滤（自动镜像官方适配器
+[chat] 名单，快照只在成功读到新名单时替换，读取失败保留旧值继续生效）→
+可选内容过滤（默认关闭，见 filter.block_at_official_bot / block_at_banned_user：
+目标消息——被回应/被撤回/被设精华的那条消息——@ 了 QQ 官方机器人（群成员
+资料 is_robot 字段，与官方适配器 ban_qq_bot 同口径）或 @ 了全局屏蔽用户时，
+该通知不补投）→ 注入。
+
 失败模式分析：最坏情况是适配器副本晚于去抖窗口入站，产生一条重复通知
 （仅观感问题）；显著优于修复前的系统性丢失。上游修复 issue #97 后，适配器
 版本永远先行入站，本插件自动退化为 no-op，可安全卸载。
@@ -33,7 +40,7 @@ from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ErrorPolicy, HookMode, Ho
 from . import onebot_client, relay_core
 from .relay_core import SHADOW_MARKER_KEY
 
-SUPPORTED_CONFIG_VERSION = "0.2.2"
+SUPPORTED_CONFIG_VERSION = "0.3.0"
 GATEWAY_NAME = "napcat_shadow_gateway"
 PLUGIN_DISPLAY_NAME = "NapCat 影子适配器"
 
@@ -41,6 +48,23 @@ PLUGIN_DISPLAY_NAME = "NapCat 影子适配器"
 MIRROR_RETRY_INTERVAL_SEC = 10.0
 # 镜像连续失败时的告警限流间隔（秒）：保证问题可见，但不刷屏。
 MIRROR_FAIL_LOG_INTERVAL_SEC = 300.0
+# 目标消息 @ 列表缓存：消息内容不可变，成功结果长缓存（TTL 只为控制内存）；
+# 查询失败短缓存，避免同一目标消息上的连发事件（连续贴/取消表情）反复打协议端。
+MESSAGE_AT_CACHE_TTL_SEC = 900.0
+MESSAGE_AT_FAIL_TTL_SEC = 30.0
+# 官方机器人判定缓存（群成员资料 is_robot）：机器人身份基本不变，成功结果长缓存；
+# 查询失败按非机器人处理并短缓存（内容过滤是降噪开关，误放行优于误屏蔽）。
+ROBOT_CHECK_TTL_SEC = 600.0
+ROBOT_CHECK_FAIL_TTL_SEC = 60.0
+
+
+def _coerce_message_id(message_id: str) -> Any:
+    """OneBot message_id 期望整数；无法转 int 时按原样传（兼容字符串消息 id 实现）。"""
+
+    try:
+        return int(message_id)
+    except (TypeError, ValueError):
+        return message_id
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -201,12 +225,16 @@ class RelaySectionConfig(PluginConfigBase):
 
 
 class FilterSectionConfig(PluginConfigBase):
-    """补投范围过滤。
+    """补投范围过滤与可选内容过滤。
 
-    开启 sync_from_adapter（默认）后，本插件在加载、配置热更新以及镜像过期时
-    自动从官方 Napcat 适配器（maibot-team.napcat-adapter）的 [chat] 配置节镜像
-    名单（群/私聊白黑名单 + ban_user_id），无需手动维护，防止把适配器名单外的
-    群/用户的通知越权补投。关闭时退回使用下方手动填写的名单。
+    范围过滤：开启 sync_from_adapter（默认）后，本插件在加载、配置热更新以及
+    镜像过期时自动从官方 Napcat 适配器（maibot-team.napcat-adapter）的 [chat]
+    配置节镜像名单（群/私聊白黑名单 + ban_user_id），无需手动维护，防止把
+    适配器名单外的群/用户的通知越权补投；关闭时退回使用下方手动填写的名单。
+
+    内容过滤（block_at_* 两项，默认关闭）：目标消息——被回应/被撤回/被设精华的
+    那条消息——@ 了 QQ 官方机器人或全局屏蔽用户时，该通知不补投。属于额外
+    降噪开关，只影响本插件的补投路径，适配器已正常送达的通知不受影响。
     """
 
     __ui_label__ = "范围过滤"
@@ -292,6 +320,28 @@ class FilterSectionConfig(PluginConfigBase):
             "hint": "宁漏投不越权",
         },
     )
+    block_at_official_bot: bool = Field(
+        default=False,
+        description=(
+            "屏蔽目标消息 @ 了 QQ 官方机器人的通知（如机器人对@它的消息贴表情回应）；"
+            "判定走群成员资料 is_robot 字段，与官方适配器 ban_qq_bot 同口径。默认关闭"
+        ),
+        json_schema_extra={
+            "label": "屏蔽@官方机器人",
+            "hint": "被@官方机器人不补投",
+        },
+    )
+    block_at_banned_user: bool = Field(
+        default=False,
+        description=(
+            "屏蔽目标消息 @ 了全局屏蔽用户的通知；名单与范围过滤同源"
+            "（镜像适配器 [chat].ban_user_id，或上方手动名单）。默认关闭"
+        ),
+        json_schema_extra={
+            "label": "屏蔽@全局屏蔽用户",
+            "hint": "被@屏蔽用户不补投",
+        },
+    )
 
 
 class ShadowAdapterConfig(PluginConfigBase):
@@ -318,6 +368,9 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         self._decision_tasks: set[asyncio.Task] = set()
         self._name_cache: dict[tuple[str, str], tuple[float, str, str]] = {}
         self._group_name_cache: dict[str, tuple[float, str]] = {}
+        # 内容过滤缓存：目标消息 @ 列表 / 官方机器人判定（均为 (group_id, user_id/message_id) 键）
+        self._msg_at_cache: dict[tuple[str, str], tuple[float, frozenset[str] | None]] = {}
+        self._robot_check_cache: dict[tuple[str, str], tuple[float, bool]] = {}
         self._mirrored_filter: dict[str, Any] | None = None
         # 镜像时序状态：成功时刻 / 上次尝试时刻（失败退避）/ 上次失败告警时刻（限流）
         self._mirror_at: float = 0.0
@@ -327,6 +380,7 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         if not self.config.plugin.enabled:
             self.ctx.logger.info("%s 已加载，但 enabled=false，保持待机", PLUGIN_DISPLAY_NAME)
             return
+        self._warn_config_sanity()
         await self._sync_filter_from_adapter()
         self._start_client()
 
@@ -348,11 +402,25 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         self.ctx.logger.info("%s 配置热更新，重建协议端连接", PLUGIN_DISPLAY_NAME)
         await self._shutdown_client()
         self._seen_adapter = relay_core.TTLSet(float(self.config.relay.seen_ttl_seconds))
+        self._warn_config_sanity()
         # 重新镜像适配器名单（sync_from_adapter 变更 / 开关切换后立即生效）
         self._mirror_attempt_at = 0.0
         self._mirror_fail_log_at = 0.0
         await self._sync_filter_from_adapter()
         self._start_client()
+
+    def _warn_config_sanity(self) -> None:
+        """启动/热更新时对易错配置组合做一次性提示（不阻断运行）。"""
+
+        seen_ttl = float(self.config.relay.seen_ttl_seconds)
+        debounce = float(self.config.relay.debounce_seconds)
+        if seen_ttl <= debounce:
+            self.ctx.logger.warning(
+                "relay.seen_ttl_seconds(%s) ≤ relay.debounce_seconds(%s)：适配器副本的"
+                "送达登记可能在决策前过期并造成必然性重复补投，建议 seen_ttl_seconds "
+                "明显大于 debounce_seconds",
+                seen_ttl, debounce,
+            )
 
     # ==================== Hook：登记适配器已成功入站的通知（只读） ====================
 
@@ -432,6 +500,17 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         if not self._filter_allows(payload):
             self.ctx.logger.debug("补投范围过滤拒绝该通知 notice_type=%s", payload.get("notice_type"))
             return
+        if not await self._content_filter_allows(payload):
+            return
+        # 注入前最后复查：范围/内容过滤中的跨插件 RPC 与 get_msg、成员资料查询
+        # 可能耗时（受 action 超时约束），期间适配器副本可能已入站登记——
+        # 此时放弃补投，把「重复通知」压回文档声明的最坏情形以内。
+        if self._seen_adapter.contains(digest) or self._injected.contains(digest):
+            self.ctx.logger.debug(
+                "决策期间适配器版本已入站，放弃补投 notice_type=%s digest=%s",
+                payload.get("notice_type"), digest[:12],
+            )
+            return
         await self._inject(payload, digest)
 
     # ==================== 范围过滤：自动镜像官方适配器 [chat] 名单 ====================
@@ -450,15 +529,22 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         - 群消息按 group_list_type/group_list，私聊按 private_list_type/private_list；
         - ban_user_id 优先级最高。
 
-        读取失败（适配器尚未就绪 / 未安装 / 停用 / 异常）时**只记录状态、不抛异常**，
-        由 :meth:`_ensure_filter_fresh` 在后续补投决策时自动重试——这一点很关键：
-        本插件的 on_load 早于同组 Napcat 适配器注册完成，首次镜像必然失败，
-        旧实现不重试，于是永久回退到（默认为空的）手动名单，全局屏蔽用户被照常补投。
+        快照替换策略：**只有成功读到完整名单时才整体替换 _mirrored_filter**。
+        读取失败（适配器尚未就绪 / 未安装 / 停用 / 瞬时异常）时保留上一份快照、
+        只记录状态、不抛异常，由 :meth:`_ensure_filter_fresh` 在后续补投决策时
+        自动重试。这一点很关键，历史上踩过两个坑：
+
+        - 本插件的 on_load 早于同组 Napcat 适配器注册完成，首次镜像必然失败
+          （旧实现不重试，于是永久回退到（默认为空的）手动名单，全局屏蔽用户
+          被照常补投）；
+        - 旧实现在每次刷新开头就清空快照，读取一旦失败（协议端/宿主瞬时抖动），
+          已镜像的 ban_user_id 随之失效，过滤整体退化为空手动名单——被全局
+          屏蔽用户的通知重新被放行补投。
         """
 
         self._mirror_attempt_at = time.time()
-        self._mirrored_filter: dict[str, Any] | None = None
         if not self.config.filter.sync_from_adapter:
+            self._mirrored_filter = None
             return
         adapter_id = str(self.config.filter.adapter_plugin_id or "").strip() or "maibot-team.napcat-adapter"
         try:
@@ -490,10 +576,15 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             )
             return
 
+        # 非法模式值的回退与官方适配器 _normalize_list_mode 对齐：
+        # DEFAULT_CHAT_LIST_TYPE = "whitelist"（宁严勿松，避免把适配器实际按
+        # 白名单过滤的群当成不过滤而越权补投）；名单过滤整体未启用才是 disabled。
         def _norm_mode(value: Any, enabled: bool) -> str:
             mode = str(value or "").strip().lower()
-            if not enabled or mode not in ("whitelist", "blacklist"):
+            if not enabled:
                 return "disabled"
+            if mode not in ("whitelist", "blacklist"):
+                return "whitelist"
             return mode
 
         def _norm_ids(raw: Any) -> list[str]:
@@ -545,10 +636,9 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
     async def _ensure_filter_fresh(self) -> None:
         """补投决策前按需（重）镜像适配器名单。
 
-        修掉「镜像只在加载时尝试一次」这一缺陷的关键：
-
         - **从未镜像成功**（启动竞态最常见）：每次决策都重试，直到拿到适配器名单为止——
-          绝不在「名单为空」的状态下继续放行；
+          开启 ``mirror_fail_closed`` 时绝不放行任何补投（默认关闭时回退手动名单，
+          默认手动名单为空即放行，属文档明示的 fail-open 语义）；
         - **已有快照但过期**：到 ``mirror_refresh_seconds`` 后重新读取，使适配器侧
           新增/移除的屏蔽用户与群名单自动生效；
         - **刷新失败但有旧快照**：按 ``MIRROR_RETRY_INTERVAL_SEC`` 退避，期间继续用旧快照过滤
@@ -611,6 +701,120 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         if mode == "blacklist" and listed:
             return False
         return True
+
+    # ==================== 内容过滤：目标消息 @ 名单（默认关闭） ====================
+
+    async def _content_filter_allows(self, payload: Mapping[str, Any]) -> bool:
+        """目标消息 @ 过滤（block_at_* 两项，默认关闭）。
+
+        针对通知所指向的“目标消息”（被回应/被撤回/被设精华的那条消息）：
+        其 @ 列表命中 QQ 官方机器人或全局屏蔽用户时，跳过该通知的补投。
+
+        设计约束：
+
+        - 两个开关都关闭时零开销（不产生任何协议端请求）；
+        - 仅群聊通知参与（表情回应/群撤回/精华均携带 group_id + message_id；
+          私聊 friend_recall 无 @ 语义，直接放行）；
+        - 目标消息查不到（撤回后过期/协议端不支持）或 @ 列表为空时放行——
+          本过滤是降噪开关而非越权防线，宁可多投也不误伤正常通知；
+        - 全局屏蔽名单与 :meth:`_filter_allows` 同源（镜像或手动），保证口径一致。
+        """
+
+        block_bot = bool(self.config.filter.block_at_official_bot)
+        block_banned = bool(self.config.filter.block_at_banned_user)
+        if not block_bot and not block_banned:
+            return True
+        group_id = str(payload.get("group_id") or "").strip()
+        message_id = str(payload.get("message_id") or "").strip()
+        if not group_id or not message_id or message_id == "0":
+            return True
+        at_ids = await self._fetch_message_at_ids(group_id, message_id)
+        if not at_ids:
+            # None = 查询失败（放行）；空集 = 目标消息没有 @ 任何具体用户
+            return True
+        if block_banned:
+            active = self._active_filter()
+            ban_ids = {
+                str(item).strip()
+                for item in ((active or {}).get("ban_user_id") or [])
+                if str(item).strip()
+            }
+            hit_banned = ban_ids & at_ids
+            if hit_banned:
+                self.ctx.logger.debug(
+                    "目标消息 @ 了全局屏蔽用户，跳过补投 notice_type=%s targets=%s",
+                    payload.get("notice_type"), sorted(hit_banned),
+                )
+                return False
+        if block_bot:
+            for at_id in sorted(at_ids):
+                if await self._is_official_bot(group_id, at_id):
+                    self.ctx.logger.debug(
+                        "目标消息 @ 了 QQ 官方机器人，跳过补投 notice_type=%s robot=%s",
+                        payload.get("notice_type"), at_id,
+                    )
+                    return False
+        return True
+
+    async def _fetch_message_at_ids(self, group_id: str, message_id: str) -> frozenset[str] | None:
+        """查询目标消息的 @ 用户号集合（get_msg + 缓存）。
+
+        返回 ``None`` 表示查询失败（连接断开/消息已过期/响应异常），调用方应放行；
+        空 frozenset 表示查询成功但目标消息没有 @ 任何具体用户。
+        """
+
+        key = (group_id, message_id)
+        now = time.time()
+        cached = self._msg_at_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        at_ids: frozenset[str] | None = None
+        ttl = MESSAGE_AT_FAIL_TTL_SEC
+        try:
+            if self._client is not None and self._client.is_connected:
+                response = await self._client.call_action(
+                    "get_msg", {"message_id": _coerce_message_id(message_id)},
+                )
+                data = response.get("data") if isinstance(response, dict) else None
+                if isinstance(data, Mapping):
+                    at_ids = frozenset(relay_core.extract_at_user_ids(data))
+                    ttl = MESSAGE_AT_CACHE_TTL_SEC
+        except Exception as exc:
+            self.ctx.logger.debug("查询目标消息 @ 列表失败 (%s/%s): %s", group_id, message_id, exc)
+        relay_core.sweep_expired_cache(self._msg_at_cache)
+        self._msg_at_cache[key] = (now + ttl, at_ids)
+        return at_ids
+
+    async def _is_official_bot(self, group_id: str, user_id: str) -> bool:
+        """判断用户在该群是否为 QQ 官方机器人（与官方适配器 ban_qq_bot 同口径）。
+
+        判定来自群成员资料的 ``is_robot`` 字段（NapCat 扩展字段，官方适配器的
+        NapCatOfficialBotGuard 同款）。查询失败按非机器人处理并短缓存；成功结果
+        长缓存——机器人身份基本不变。
+        """
+
+        key = (group_id, user_id)
+        now = time.time()
+        cached = self._robot_check_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        is_robot = False
+        ttl = ROBOT_CHECK_FAIL_TTL_SEC
+        try:
+            if self._client is not None and self._client.is_connected:
+                response = await self._client.call_action(
+                    "get_group_member_info",
+                    {"group_id": int(group_id), "user_id": int(user_id), "no_cache": False},
+                )
+                data = response.get("data") if isinstance(response, dict) else None
+                if isinstance(data, Mapping):
+                    is_robot = bool(data.get("is_robot"))
+                    ttl = ROBOT_CHECK_TTL_SEC
+        except Exception as exc:
+            self.ctx.logger.debug("查询群成员资料失败 (%s/%s): %s", group_id, user_id, exc)
+        relay_core.sweep_expired_cache(self._robot_check_cache)
+        self._robot_check_cache[key] = (now + ttl, is_robot)
+        return is_robot
 
     async def _inject(self, payload: dict[str, Any], digest: str) -> None:
         notice_type = str(payload.get("notice_type") or "").strip()
@@ -687,6 +891,8 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             "is_notify": True,
             "session_id": "",
             "processed_plain_text": text,
+            # 与官方适配器通知注入口径对齐（codecs/notice/message_codec.py 同带此字段）
+            "display_message": text,
         }
 
         route_metadata: dict[str, Any] = {}
@@ -738,6 +944,7 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.debug("查询昵称失败 (%s/%s): %s", group_id, user_id, exc)
         ttl = float(self.config.relay.nickname_cache_ttl_sec) if (nickname or card) else 30.0
+        relay_core.sweep_expired_cache(self._name_cache)
         self._name_cache[key] = (now + ttl, nickname, card)
         return nickname, card
 
@@ -756,6 +963,7 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.debug("查询群名失败 (%s): %s", group_id, exc)
         ttl = float(self.config.relay.nickname_cache_ttl_sec) if name else 30.0
+        relay_core.sweep_expired_cache(self._group_name_cache)
         self._group_name_cache[group_id] = (now + ttl, name)
         return name
 
@@ -782,6 +990,9 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             task.cancel()
         self._decision_tasks.clear()
         self._pending_digests.clear()
+        # 协议端连接相关的查询缓存一并失效：重连后（可能换了账号/协议端）重新查询
+        self._msg_at_cache.clear()
+        self._robot_check_cache.clear()
         client = self._client
         self._client = None
         if client is not None:
@@ -808,6 +1019,11 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             self.ctx.logger.warning("上报网关就绪状态失败: %s", exc)
 
     async def _on_ws_disconnected(self) -> None:
+        # 协议端断开重连可能换了账号/协议端实例，查询类缓存全部失效重查
+        self._name_cache.clear()
+        self._group_name_cache.clear()
+        self._msg_at_cache.clear()
+        self._robot_check_cache.clear()
         try:
             await self.ctx.gateway.update_state(GATEWAY_NAME, ready=False)
         except Exception:

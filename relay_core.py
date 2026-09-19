@@ -16,6 +16,7 @@ from hashlib import sha1
 from typing import Any, Mapping
 
 import json
+import re
 import time
 
 # 本插件接管的四类“易丢信息”（与 NapCat 适配器去重键缺陷相关的通知类型）。
@@ -82,23 +83,54 @@ def resolve_actor_user_id(payload: Mapping[str, Any]) -> str:
     return "" if actor == "0" else actor
 
 
-def collect_enrich_user_ids(payload: Mapping[str, Any]) -> list[str]:
-    """列出需要查昵称的用户号（按文本渲染所需，去重、保序）。"""
+# CQ 码形态的 at 段（get_msg 的 raw_message 回退形态）：[CQ:at,qq=123456]。
+# qq 值限定纯数字——"all"（全体成员）不是具体用户，天然被排除。
+_AT_CQ_PATTERN = re.compile(r"\[CQ:at,[^\]]*?\bqq=(\d+)", re.IGNORECASE)
 
-    notice_type = str(payload.get("notice_type") or "").strip()
+
+def extract_at_user_ids(message_data: Any) -> list[str]:
+    """提取消息中被 @ 的用户号（全体成员 "all" 不算具体用户，不返回）。
+
+    接受三种形态（NapCat ``get_msg`` 返回的 ``data`` 及其子字段均兼容）：
+
+    - ``get_msg`` 响应 data / 含 ``message`` 键的 dict：递归取 ``message``，
+      缺失时回退 ``raw_message``（CQ 码字符串）；
+    - 消息段（数组或单个 dict）：``{"type": "at", "data": {"qq": "123"}}``；
+    - CQ 码字符串：``"[CQ:at,qq=123] 文本"``。
+
+    OneBot v11 的 at 段 ``data.qq`` 可能是 int 或 str，统一归一化为字符串。
+    """
+
     ids: list[str] = []
 
     def _push(value: Any) -> None:
         normalized = str(value or "").strip()
-        if normalized and normalized != "0" and normalized not in ids:
+        if not normalized or normalized == "0" or normalized.lower() == "all":
+            return
+        if normalized not in ids:
             ids.append(normalized)
 
-    if notice_type == "essence":
-        _push(payload.get("operator_id"))
-        _push(payload.get("sender_id"))
-        _push(payload.get("user_id"))
-    else:
-        _push(resolve_actor_user_id(payload))
+    if isinstance(message_data, Mapping):
+        message = message_data.get("message")
+        if message is not None:
+            return extract_at_user_ids(message)
+        raw_message = message_data.get("raw_message")
+        if isinstance(raw_message, str) and raw_message.strip():
+            return extract_at_user_ids(raw_message)
+        if str(message_data.get("type") or "").strip() == "at":
+            data = message_data.get("data")
+            if isinstance(data, Mapping):
+                _push(data.get("qq"))
+        return ids
+    if isinstance(message_data, (list, tuple)):
+        for segment in message_data:
+            for at_id in extract_at_user_ids(segment):
+                if at_id not in ids:
+                    ids.append(at_id)
+        return ids
+    if isinstance(message_data, str):
+        for match in _AT_CQ_PATTERN.finditer(message_data):
+            _push(match.group(1))
     return ids
 
 
@@ -183,6 +215,22 @@ def extract_adapter_notice(message_dict: Mapping[str, Any]) -> tuple[str, Mappin
     if not isinstance(payload, Mapping):
         return None
     return notice_type, payload
+
+
+def sweep_expired_cache(cache: dict[Any, tuple[float, Any]]) -> None:
+    """清理形如 ``{键: (到期时刻, 值)}`` 的查询缓存中的已过期条目（原地修改）。
+
+    TTL 只保证读取新鲜度，不主动清理则条目随事件量只增不减。查询类缓存
+    （昵称/群名/@ 列表/机器人判定）量级小、写入频率低，在每次写入时顺手
+    清扫一次即可保持内存有界。
+    """
+
+    if not cache:
+        return
+    now = time.time()
+    expired = [key for key, entry in cache.items() if entry[0] <= now]
+    for key in expired:
+        cache.pop(key, None)
 
 
 class TTLSet:

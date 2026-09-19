@@ -110,6 +110,9 @@ class OneBotWSClient:
         path = self._path or "/"
         if not path.startswith("/"):
             path = f"/{path}"
+        # path 也做 URL 编码（保留路径分隔符），避免非法字符导致 websockets.connect 抛出
+        # 携带完整 URI 的异常（URI 中含 access_token）
+        path = quote(path, safe="/")
         uri = f"ws://{self._host}:{self._port}{path}"
         if self._token:
             uri = f"{uri}?access_token={quote(self._token, safe='')}"
@@ -141,7 +144,7 @@ class OneBotWSClient:
                 raise
             except Exception as exc:
                 if not self._closing:
-                    self._log("warning", "协议端连接异常，%s 秒后重连: %s", self._reconnect_delay, exc)
+                    self._log("warning", "协议端连接异常，%s 秒后重连: %s", self._reconnect_delay, self._scrub(exc))
             finally:
                 self._ws = None
                 self._fail_pending(ConnectionError("影子适配器连接断开"))
@@ -160,9 +163,8 @@ class OneBotWSClient:
             self._log("debug", "忽略无法解析的 WS 帧")
             return
         for item in split_payloads(data):
-            echo = item.get("echo")
-            if echo is not None:
-                future = self._pending.pop(str(echo), None)
+            if is_action_response(item):
+                future = self._pending.pop(str(item["echo"]), None)
                 if future is not None and not future.done():
                     future.set_result(item)
                 continue
@@ -195,6 +197,14 @@ class OneBotWSClient:
         return response if isinstance(response, dict) else {}
 
     # ---------- 内部 ----------
+
+    def _scrub(self, exc: BaseException) -> str:
+        """把异常文本中的访问令牌脱敏——部分 websockets 异常消息会携带完整 URI。"""
+
+        text = str(exc)
+        if self._token and self._token in text:
+            text = text.replace(self._token, "***")
+        return text
 
     def _fail_pending(self, error: Exception) -> None:
         for future in self._pending.values():
