@@ -1,5 +1,22 @@
 # 更新日志
 
+## 0.3.1（2026-09-27）
+
+**正式退役版本：MaiBot 1.3.0 起本插件失效，无法加载。**
+
+- 官方合并版适配器（SnowLuma Adapter 1.0.x，随 MaiBot 1.3.0 发布，已合并 NapCat 适配器）
+  已修复通知去重缺陷（Napcat-Adapter issue #97：通知去重键改为事件级 SHA-1 摘要），
+  四类通知可靠入站，本插件自动退化为 no-op，补位使命完成。
+- `_manifest.json` 的宿主版本区间由 `1.0.0 ~ 1.99.99` 收窄为 `1.0.0 ~ 1.2.99`：
+  在 **MaiBot 1.3.0 及以上**本插件因 manifest 版本校验不通过而注册失败（预期行为）；
+  1.2.x 环境仍可安装。
+- 已知边界（仅影响 1.2.x + 合并版适配器 + 独占中继模式的组合）：合并版适配器把聊天
+  黑白名单迁移到宿主 `adapter_policy.toml`，适配器配置不再有 `[chat]` 节，本插件的
+  `filter.sync_from_adapter` 镜像在该组合下无法工作（镜像失败按既有 fail-open/fail-closed
+  语义回退）。默认模式下镜像永不参与补投决策，不受影响。
+- README 失效声明与 manifest description 同步更新；`SUPPORTED_CONFIG_VERSION` 同步为
+  0.3.1。功能代码零改动。
+
 ## 0.3.0（2026-09-19）
 
 - **修复：镜像刷新失败会打穿全局屏蔽。** 旧版 `_sync_filter_from_adapter()` 在每次刷新
