@@ -5,6 +5,8 @@ SnowLuma 本体），事件由本体广播给所有连接（含 action 响应按
 因此本连接与适配器的连接互不干扰。
 
 鉴权：access_token 走 URL query（OneBot v11 规范支持，NapCat / SnowLuma 均接受）。
+协议生态现状如此，token 可能进入协议端/中间代理的访问日志，因此本模块的异常文本
+与日志一律脱敏（见 _scrub），也不要在日志系统记录完整连接 URL。
 websockets 包为 manifest 声明的 python_package 依赖，此处延迟探测以支持离线导入。
 """
 
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
@@ -23,6 +26,11 @@ except ImportError:  # pragma: no cover
 
 EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 StateCallback = Callable[[], Awaitable[None]]
+
+# 重连指数退避上限（秒）：连续失败按 reconnect_delay_sec 倍增，到此封顶。
+RECONNECT_BACKOFF_MAX_SEC = 300.0
+# 异常文本中 URL query 里的 access_token（可能被 URL 编码），统一打码。
+_ACCESS_TOKEN_RE = re.compile(r"access_token=[^&\s'\"<>]+")
 
 
 def split_payloads(data: Any) -> list[Any]:
@@ -74,6 +82,7 @@ class OneBotWSClient:
         self._pending: dict[str, asyncio.Future] = {}
         self._closing = False
         self._missing_dependency_logged = False
+        self._reconnect_attempts = 0
 
     # ---------- 生命周期 ----------
 
@@ -125,6 +134,7 @@ class OneBotWSClient:
                 self._log("error", "缺少 websockets 依赖，无法连接协议端（manifest 已声明，请检查安装）")
             return
 
+        delay = self._reconnect_delay
         while not self._closing:
             try:
                 async with websockets.connect(
@@ -136,15 +146,34 @@ class OneBotWSClient:
                     max_size=2**23,
                 ) as ws:
                     self._ws = ws
+                    self._reconnect_attempts = 0
+                    delay = self._reconnect_delay
                     self._log("info", "已连接协议端 %s:%s", self._host, self._port)
-                    await self._safe_state_callback(self._on_connected)
-                    async for raw in ws:
-                        await self._handle_raw(raw)
+                    # 连接回调与接收循环并发执行：必须先让接收循环跑起来再触发
+                    # 回调，回调内的 action 响应才能被 _handle_raw 按 echo 配对。
+                    # 旧实现在此处同步 await 回调，接收循环尚未启动，
+                    # get_login_info 的响应永远无法配对，必然超时并阻塞建连。
+                    connected_task = asyncio.create_task(
+                        self._safe_state_callback(self._on_connected)
+                    )
+                    try:
+                        async for raw in ws:
+                            await self._handle_raw(raw)
+                    finally:
+                        if not connected_task.done():
+                            connected_task.cancel()
+                        try:
+                            await connected_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            pass
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if not self._closing:
-                    self._log("warning", "协议端连接异常，%s 秒后重连: %s", self._reconnect_delay, self._scrub(exc))
+                    delay = self._next_reconnect_delay()
+                    self._log("warning", "协议端连接异常，%s 秒后重连: %s", delay, self._scrub(exc))
             finally:
                 self._ws = None
                 self._fail_pending(ConnectionError("影子适配器连接断开"))
@@ -152,7 +181,14 @@ class OneBotWSClient:
                     await self._safe_state_callback(self._on_disconnected)
             if self._closing:
                 break
-            await asyncio.sleep(self._reconnect_delay)
+            await asyncio.sleep(delay)
+
+    def _next_reconnect_delay(self) -> float:
+        """下一次重连等待：指数退避（初始 reconnect_delay_sec，倍增，封顶 300 秒）。"""
+
+        delay = min(self._reconnect_delay * (2 ** self._reconnect_attempts), RECONNECT_BACKOFF_MAX_SEC)
+        self._reconnect_attempts += 1
+        return delay
 
     # ---------- 接收与 action ----------
 
@@ -199,12 +235,16 @@ class OneBotWSClient:
     # ---------- 内部 ----------
 
     def _scrub(self, exc: BaseException) -> str:
-        """把异常文本中的访问令牌脱敏——部分 websockets 异常消息会携带完整 URI。"""
+        """把异常文本中的访问令牌脱敏——部分 websockets 异常消息会携带完整 URI。
+
+        两层覆盖：① token 原文替换；② URL query 形态的 access_token=xxx 统一打码
+        （token 可能被 URL 编码，原文匹配不到时兜底），避免完整连接 URL 进入日志。
+        """
 
         text = str(exc)
         if self._token and self._token in text:
             text = text.replace(self._token, "***")
-        return text
+        return _ACCESS_TOKEN_RE.sub("access_token=***", text)
 
     def _fail_pending(self, error: Exception) -> None:
         for future in self._pending.values():

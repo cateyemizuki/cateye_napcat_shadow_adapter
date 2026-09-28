@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "cateye.napcat-shadow-adapter",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "name": "NapCat 影子适配器",
   "description": "影子中继：监控 NapCat 适配器易被去重误丢的四类通知（表情回应/群撤回/好友撤回/精华消息），通过独立 OneBot WebSocket 连接协议端，对适配器未成功入站的事件以 is_notify 合成通知补投；适配器已送达的事件自动跳过。自动镜像适配器黑白名单与全局屏蔽用户；可选按目标消息 @ 官方机器人/@ 全局屏蔽用户过滤补投（默认关闭）。不改写、不拦截，上游修复后自动失效。合并版适配器（SnowLuma Adapter 1.0.x，随 MaiBot 1.3.0 发布）已修复通知去重缺陷（Napcat-Adapter issue #97），本插件使命完成：自 0.3.1 起 manifest 仅支持宿主 1.2.x，在 MaiBot 1.3.0 上注册失败属预期行为，请直接停用卸载。",
   "author": {

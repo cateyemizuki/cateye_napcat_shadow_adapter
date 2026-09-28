@@ -40,7 +40,7 @@ from maibot_sdk.types import CONFIG_RELOAD_SCOPE_SELF, ErrorPolicy, HookMode, Ho
 from . import onebot_client, relay_core
 from .relay_core import SHADOW_MARKER_KEY
 
-SUPPORTED_CONFIG_VERSION = "0.3.1"
+SUPPORTED_CONFIG_VERSION = "0.3.2"
 GATEWAY_NAME = "napcat_shadow_gateway"
 PLUGIN_DISPLAY_NAME = "NapCat 影子适配器"
 
@@ -135,10 +135,10 @@ class ServerSectionConfig(PluginConfigBase):
     )
     reconnect_delay_sec: float = Field(
         default=5.0, ge=1.0, le=300.0,
-        description="断线重连间隔（秒）",
+        description="断线重连初始间隔（秒）：连续失败按指数退避（倍增，上限 300 秒），连接成功后重置",
         json_schema_extra={
-            "label": "断线重连间隔（秒）",
-            "hint": "断线重连间隔秒数",
+            "label": "断线重连初始间隔（秒）",
+            "hint": "重连初始间隔，指数退避",
         },
     )
     action_timeout_sec: float = Field(
@@ -220,6 +220,17 @@ class RelaySectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "昵称缓存时长（秒）",
             "hint": "昵称缓存时长秒数",
+        },
+    )
+    stale_event_max_age_sec: float = Field(
+        default=600.0, ge=0.0, le=86400.0,
+        description=(
+            "断线恢复后积压事件的新鲜度上限（秒）：事件时间早于断线时刻该秒数以上视为过期，"
+            "放弃补投（断线期间的实时消息仍由适配器兜底）；0 = 不做新鲜度检查"
+        ),
+        json_schema_extra={
+            "label": "积压事件新鲜度上限（秒）",
+            "hint": "过期积压事件不补投",
         },
     )
 
@@ -310,10 +321,10 @@ class FilterSectionConfig(PluginConfigBase):
         },
     )
     mirror_fail_closed: bool = Field(
-        default=False,
+        default=True,
         description=(
-            "镜像读不到适配器名单时是否拒绝一切补投（fail-closed）：开启后宁可漏投也不越权；"
-            "关闭则回退上方手动名单（默认，行为与旧版一致）"
+            "镜像读不到适配器名单时是否拒绝一切补投（fail-closed，默认开启）：宁可漏投也不越权；"
+            "关闭则回退上方手动名单。0.3.2 起默认翻转（旧版默认关闭，行为与旧版一致需显式关闭）"
         ),
         json_schema_extra={
             "label": "镜像失败即拒投",
@@ -376,6 +387,8 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         self._mirror_at: float = 0.0
         self._mirror_attempt_at: float = 0.0
         self._mirror_fail_log_at: float = 0.0
+        # 最近一次协议端断开时刻（用于断线恢复后的积压事件新鲜度检查）
+        self._disconnected_at: float = 0.0
 
         if not self.config.plugin.enabled:
             self.ctx.logger.info("%s 已加载，但 enabled=false，保持待机", PLUGIN_DISPLAY_NAME)
@@ -447,7 +460,9 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
                 return
             _notice_type, payload = extracted
             self._seen_adapter.add(relay_core.event_digest(payload))
-        except Exception:
+        except Exception as exc:
+            # 登记逻辑自身故障不能完全静默：至少 debug 留痕（不影响主入站链）
+            self.ctx.logger.debug("登记适配器送达摘要失败（不影响主链）: %s", exc)
             return
         return None
 
@@ -472,6 +487,22 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
     async def _on_ws_event(self, payload: dict[str, Any]) -> None:
         if not relay_core.is_managed_notice(payload, self._enabled_types()):
             return  # message 事件与其他通知一律忽略：普通消息仍由适配器独家注入
+        # 断线恢复后的积压事件新鲜度检查：WS 接收循环在断线期间积压（不丢失）
+        # 的帧会在重连后一次性涌入，其中事件时间早于断线时刻超过
+        # stale_event_max_age_sec 的陈年事件不再补投（实时消息仍由适配器兜底，
+        # 补投陈年通知只会造成"迟到的重复/惊吓"）。
+        max_age = float(self.config.relay.stale_event_max_age_sec)
+        if max_age > 0.0 and self._disconnected_at > 0.0:
+            event_time = payload.get("time")
+            if (
+                isinstance(event_time, (int, float)) and event_time > 0
+                and event_time < self._disconnected_at - max_age
+            ):
+                self.ctx.logger.debug(
+                    "断线恢复后的积压事件过于陈旧（早于断线时刻 %s 秒以上），放弃补投 notice_type=%s",
+                    max_age, payload.get("notice_type"),
+                )
+                return
         digest = relay_core.event_digest(payload)
         if digest in self._pending_digests or self._injected.contains(digest):
             return
@@ -637,8 +668,8 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         """补投决策前按需（重）镜像适配器名单。
 
         - **从未镜像成功**（启动竞态最常见）：每次决策都重试，直到拿到适配器名单为止——
-          开启 ``mirror_fail_closed`` 时绝不放行任何补投（默认关闭时回退手动名单，
-          默认手动名单为空即放行，属文档明示的 fail-open 语义）；
+          开启 ``mirror_fail_closed`` 时（0.3.2 起默认开启）绝不放行任何补投；
+          显式关闭后回退手动名单（默认手动名单为空即放行，属文档明示的 fail-open 语义）；
         - **已有快照但过期**：到 ``mirror_refresh_seconds`` 后重新读取，使适配器侧
           新增/移除的屏蔽用户与群名单自动生效；
         - **刷新失败但有旧快照**：按 ``MIRROR_RETRY_INTERVAL_SEC`` 退避，期间继续用旧快照过滤
@@ -995,10 +1026,14 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
         self._robot_check_cache.clear()
         client = self._client
         self._client = None
+        self._disconnected_at = 0.0
         if client is not None:
             await client.stop()
 
     async def _on_ws_connected(self) -> None:
+        # 本回调由 onebot_client 在接收循环启动后以并发任务触发：get_login_info
+        # 的响应能被接收循环按 echo 配对，不再出现"回调同步 await 导致必然超时"。
+        # 查询失败（协议端不支持等）仅告警，事件载荷自带的 self_id 仍可兜底。
         try:
             response = await self._client.call_action("get_login_info", {})
             data = response.get("data") if isinstance(response, dict) else None
@@ -1019,6 +1054,8 @@ class NapCatShadowAdapterPlugin(MaiBotPlugin):
             self.ctx.logger.warning("上报网关就绪状态失败: %s", exc)
 
     async def _on_ws_disconnected(self) -> None:
+        # 记录断开时刻，供断线恢复后的积压事件新鲜度检查使用
+        self._disconnected_at = time.time()
         # 协议端断开重连可能换了账号/协议端实例，查询类缓存全部失效重查
         self._name_cache.clear()
         self._group_name_cache.clear()
